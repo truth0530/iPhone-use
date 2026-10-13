@@ -1,6 +1,6 @@
 ---
 name: iphone-use-setup
-description: 配置用户自己的 iPhone 上的 PUA。默认 read-only 与 strict 只允许 setup status，不 fetch、不签名、不启动。用户自己改为 standard 之后才安装并启动。用 USB 诊断 Xcode 连接，不把手机控制端口开到 Wi-Fi。
+description: 사용자 자신의 iPhone에 PUA를 구성합니다. 기본 read-only와 strict는 setup status만 허용하고 fetch, 서명, 시작은 하지 않습니다. 사용자가 standard로 바꾼 뒤에만 설치하고 시작합니다. USB로 Xcode 연결을 진단하고 제어 포트를 Wi-Fi에 열지 않습니다.
 ---
 
 # 把 iPhone 配置为 READY

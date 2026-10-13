@@ -1,6 +1,6 @@
 ---
 name: iphone-use
-description: 通过 PUA MCP 按当前安全模式操作真实 iPhone。默认 read-only 只调用 setup status 和读取，不启动服务、不点击、不输入。用户自己把 IPHONE_USE_SAFETY_MODE 设为 standard 之后才走启动和操作流程。正常返回不证明业务成功。
+description: PUA MCP로 현재 안전 모드에 맞춰 실제 iPhone을 다룹니다. 기본 read-only는 setup status와 읽기만 하고 서비스를 켜거나 누르거나 입력하지 않습니다. 사용자가 IPHONE_USE_SAFETY_MODE=standard로 바꾼 뒤에만 조작합니다. 정상 반환은 업무 성공이 아닙니다.
 ---
 
 # 用 PUA 完成 iPhone 任务
