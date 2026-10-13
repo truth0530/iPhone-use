@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -18,6 +19,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -30,9 +32,16 @@ import uuid
 
 WDA_COMMIT = "d17782422d55ff1e5e0ceb74eb1fd509cc0c35b6"
 WDA_VERSION = "16.14.0"
+NETWORK_POLICY = "device-loopback-v1"
 WDA_REPOSITORY = "https://github.com/appium/WebDriverAgent.git"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STATE = Path.home() / ".local/share/iphone-use"
+
+
+class NoStatusRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # A local health probe must never follow a redirect, even to another local port.
+        raise urllib.error.HTTPError(req.full_url, code, "WDA status redirects are forbidden", headers, fp)
 
 
 def state_directory(explicit=None):
@@ -64,10 +73,59 @@ def _redact(value):
     return value
 
 
-def _read_json(path, default=None):
+def read_exclusive_bytes(path, limit=None):
+    """Bytes of one regular file. A hard link would expose the other inode."""
     try:
-        return json.loads(Path(path).read_text())
-    except (OSError, ValueError):
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return None
+        with os.fdopen(fd, "rb") as stream:
+            fd = None
+            return stream.read() if limit is None else stream.read(limit)
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def read_exclusive_text(path):
+    data = read_exclusive_bytes(path)
+    if data is None:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeError:
+        return None
+
+
+def open_unaliased(path, flags):
+    """Open a regular nlink==1 file and chmod that inode only after the check."""
+    if flags & os.O_TRUNC:
+        raise OSError(errno.EINVAL, "O_TRUNC would rewrite a hardlink before the link check")
+    fd = os.open(path, flags | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError(errno.EPERM, "aliased file")
+        os.fchmod(fd, 0o600)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_json(path, default=None):
+    text = read_exclusive_text(path)
+    if text is None:
+        return default
+    try:
+        return json.loads(text)
+    except ValueError:
         return default
 
 
@@ -77,10 +135,13 @@ def _write_json(path, value):
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as stream:
+            fd = None
             json.dump(value, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
         os.replace(name, path)
     finally:
+        if fd is not None:
+            os.close(fd)
         with contextlib.suppress(FileNotFoundError):
             os.unlink(name)
 
@@ -130,6 +191,10 @@ def _diagnose(text):
          "Reconnect USB, unlock the iPhone, accept Trust This Computer yourself and verify pairing in Xcode Window > Devices and Simulators."),
         (("address already in use", "eaddrinuse", "local forward port is occupied"),
          "The local forward port is in use. Reuse an already healthy WDA, stop only this plugin's owned job, or configure another local port; do not kill unrelated processes."),
+        (("tls client", "tls material", "client certificate", "handshake"),
+         "The Mac forwarder requires its own TLS 1.3 client certificate in the local state directory. Do not copy another computer's tls directory. A client without that certificate receives no HTTP."),
+        (("usb connect failed", "usb forward failed", "usbmux"),
+         "Reconnect the USB cable. The phone control port stays on 127.0.0.1 and is not reachable over Wi-Fi. Do not bind that port to the phone's Wi-Fi address."),
     ]
     return [hint for needles, hint in cases if any(needle in text for needle in needles)]
 
@@ -147,9 +212,13 @@ class SetupManager:
         self.base_url = base_url.rstrip("/")
         self.port = parsed.port or 80
         self._workers = {}
-        for directory in (self.state_dir, self.state_dir / "jobs", self.state_dir / "logs", self.state_dir / "runtime"):
+        directories=(self.state_dir, self.state_dir / "jobs", self.state_dir / "logs", self.state_dir / "runtime")
+        # Never chmod/create through a reused lifecycle directory symlink.
+        if any(directory.is_symlink() for directory in directories):
+            raise ValueError("Runtime lifecycle directories must not use symlinks.")
+        for directory in directories:
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            directory.chmod(0o700)
+            if directory.stat().st_mode&0o777!=0o700:directory.chmod(0o700)
 
     @property
     def config(self):
@@ -157,11 +226,13 @@ class SetupManager:
 
     @contextlib.contextmanager
     def _lock(self):
-        path = self.state_dir / ".lock"
-        with open(path, "a") as stream:
-            path.chmod(0o600)
-            fcntl.flock(stream, fcntl.LOCK_EX)
+        fd = open_unaliased(self.state_dir / ".lock", os.O_RDWR | os.O_CREAT | os.O_APPEND)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
             yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     def _validate_config(self, config):
         for key, pattern in (("udid", r"[A-Za-z0-9-]{8,64}"), ("team_id", r"[A-Z0-9]{10}"),
@@ -176,17 +247,85 @@ class SetupManager:
             raise ValueError(f"local_port must match the MCP base URL port ({self.port}); update the plugin URL and restart MCP to change ports.")
         return config
 
-    def _source(self, config):
+    def _source(self, config, contents=None):
         source = Path(config["source_dir"]).expanduser().resolve()
         if not (source / "WebDriverAgent.xcodeproj/project.pbxproj").is_file():
             raise ValueError("WDA source is missing. Run fetch, or configure source_dir to an existing pinned checkout.")
-        revision = _run(["git", "-C", str(source), "rev-parse", "HEAD"])
+        git = ["git", "--no-replace-objects", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", str(source)]
+        revision = _run(git + ["rev-parse", "HEAD"])
         if not revision["ok"] or revision["stdout"].strip() != WDA_COMMIT:
             raise ValueError(f"WDA source must be pinned to {WDA_VERSION} ({WDA_COMMIT}); existing checkouts are never changed automatically.")
-        dirty = _run(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no"])
-        if not dirty["ok"] or dirty["stdout"].strip():
-            raise ValueError("Pinned WDA source has tracked changes. Use fetch for a clean isolated checkout; existing work is preserved.")
+        tree = _run(git + ["ls-tree", "-r", "-z", "--full-tree", WDA_COMMIT])
+        if not tree["ok"] or not tree["stdout"]:
+            raise ValueError("Cannot verify the pinned WDA tree.")
+        expected = set()
+        for entry in tree["stdout"].rstrip("\0").split("\0"):
+            metadata, name = entry.split("\t", 1)
+            mode, kind, digest = metadata.split()
+            path = source / name
+            if mode not in ("100644", "100755") or kind != "blob" or path.is_symlink() or not path.is_file():
+                raise ValueError("Pinned WDA source contains an unsupported or missing file: " + name)
+            data = path.read_bytes()
+            actual = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+            if actual != digest or bool(path.stat().st_mode & 0o111) != (mode == "100755"):
+                raise ValueError("Pinned WDA source bytes or executable mode changed: " + name)
+            expected.add(name)
+            if contents is not None:contents[name]=(mode,data)
+        # Git status hides assume-unchanged files and ignored Xcode configuration.
+        # Walk the actual tree too; preserve unexpected material and refuse to build.
+        for directory, dirs, files in os.walk(source, followlinks=False):
+            if Path(directory) == source:dirs[:] = [name for name in dirs if name != ".git"]
+            for name in dirs + files:
+                path = Path(directory) / name
+                relative = path.relative_to(source).as_posix()
+                if path.is_symlink() or (name in files and relative not in expected):
+                    raise ValueError("Unexpected WDA source material: " + relative)
         return source
+
+    def _loopback_source(self, config, create=False, source=None):
+        """Build only from pinned bytes plus two exact listener patches."""
+        contents={}
+        self._source(config,contents)
+        patches={
+            "WebDriverAgentLib/Utilities/FBConfiguration.m":(
+                b'- (NSString *)bindingIPAddress\n{\n  // Existence of USE_IP in the environment allows specifying which interface to bind to\n  if (NSProcessInfo.processInfo.environment[@"USE_IP"] &&\n      [NSProcessInfo.processInfo.environment[@"USE_IP"] length] > 0) {\n    return NSProcessInfo.processInfo.environment[@"USE_IP"];\n  }\n\n  return nil;\n}',
+                b'- (NSString *)bindingIPAddress\n{\n  return @"127.0.0.1";\n}'),
+            "WebDriverAgentLib/Routing/FBTCPSocket.m":(
+                b'- (BOOL)startWithError:(NSError **)error\n{\n',
+                b'- (BOOL)startWithError:(NSError **)error\n{\n  self.interface = @"127.0.0.1";\n'),
+        }
+        for name,(before,after) in patches.items():
+            mode,data=contents.get(name,(None,b""))
+            if data.count(before)!=1:raise ValueError("Pinned listener patch does not match: "+name)
+            contents[name]=(mode,data.replace(before,after,1))
+        parent=self.state_dir/"runtime"
+        if create:
+            stage=Path(tempfile.mkdtemp(prefix="wda-loopback-",dir=parent))
+            for name,(mode,data) in contents.items():
+                target=stage/name
+                target.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+                target.write_bytes(data)
+                target.chmod(0o755 if mode=="100755" else 0o644)
+        else:
+            saved=_read_json(self.state_dir/"build.json",{})
+            location=str(source) if source is not None else saved.get("loopback_source")
+            if not isinstance(location,str):raise ValueError("Build has no verified loopback source. Rebuild manually.")
+            stage=Path(location)
+            if stage.is_symlink() or stage.resolve().parent!=parent.resolve() or not stage.name.startswith("wda-loopback-"):
+                raise ValueError("Invalid loopback build source location.")
+        actual=set()
+        for directory,dirs,files in os.walk(stage,followlinks=False):
+            for name in dirs+files:
+                target=Path(directory)/name
+                relative=target.relative_to(stage).as_posix()
+                if target.is_symlink():raise ValueError("Loopback build source contains a symlink.")
+                if name in files:
+                    mode,data=contents.get(relative,(None,None))
+                    if data is None or target.read_bytes()!=data or bool(target.stat().st_mode&0o111)!=(mode=="100755"):
+                        raise ValueError("Loopback build source changed: "+relative)
+                    actual.add(relative)
+        if actual!=set(contents):raise ValueError("Loopback build source is incomplete.")
+        return stage
 
     @staticmethod
     def parse_devices(document):
@@ -241,15 +380,33 @@ class SetupManager:
 
     def _probe_status(self):
         try:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            request = urllib.request.Request(self.base_url + "/status", headers={"Accept": "application/json"})
-            with opener.open(request, timeout=1.5) as response:
-                document = json.loads(response.read(1024 * 1024))
+            from wda_client import WDAClient,WDAError
+            from wda_tls import client_context, material_dir
+            if "IPHONE_USE_BROKER_FD" in os.environ:
+                document=WDAClient(self.base_url,read_only=True,tls_state=self.state_dir).request("GET","/status",timeout=1.5)
+            else:
+                tls_dir = material_dir(self.state_dir)
+                handlers = [urllib.request.ProxyHandler({}), NoStatusRedirect()]
+                target = self.base_url + "/status"
+                if tls_dir is not None:
+                    handlers.append(urllib.request.HTTPSHandler(context=client_context(tls_dir)))
+                    target = "https://127.0.0.1:%s/status" % self.port
+                opener = urllib.request.build_opener(*handlers)
+                request = urllib.request.Request(target, headers={"Accept": "application/json"})
+                with opener.open(request, timeout=1.5) as response:
+                    document = json.loads(response.read(1024 * 1024))
             value = document.get("value", {})
             return {"reachable": True, "ready": value.get("ready") is True, "wda": value,
                     "next_step": "Run MCP session + source smoke check before declaring the phone usable."}
-        except (OSError, ValueError, urllib.error.URLError) as error:
-            return {"reachable": False, "ready": False, "error": _redact(error)}
+        except (OSError, ValueError, urllib.error.URLError, WDAError) as error:
+            if isinstance(error, urllib.error.HTTPError):error.close()
+            text = _redact(error)
+            if "redirect" in text.lower():
+                step = "The status check refused a redirect and did not contact another host."
+            else:
+                hints = _diagnose(text)
+                step = hints[0] if hints else "The loopback forwarder did not answer. Reconnect USB. The phone control port stays on 127.0.0.1 and is not opened on Wi-Fi."
+            return {"reachable": False, "ready": False, "error": text, "next_step": step}
 
     def mirroring_running(self):
         if sys.platform != "darwin":
@@ -314,7 +471,7 @@ class SetupManager:
                 "signing_note": "Personal Team has a limited number of development apps (typically 3) and short-lived provisioning (typically 7 days). Never uninstall unrelated apps automatically."}
 
     def _profile_status(self):
-        profiles = list((self.state_dir / "derived_data/Build/Products").glob("Debug-iphoneos/*.app/embedded.mobileprovision"))
+        profiles = list((self._derived_data() / "Build/Products").glob("Debug-iphoneos/*.app/embedded.mobileprovision"))
         if not profiles:
             return {"known": False, "note": "No built provisioning profile yet; Xcode signing and phone certificate trust require user verification."}
         profile = max(profiles, key=lambda path: path.stat().st_mtime)
@@ -388,15 +545,62 @@ class SetupManager:
             return False
 
     def _matching_job(self, job, config):
+        build=_read_json(self.state_dir/"build.json",{})
         return (isinstance(job.get("config"), dict)
+                and job.get("network_policy")==NETWORK_POLICY
+                and isinstance(job.get("loopback_source"),str)
+                and job.get("loopback_source")==build.get("loopback_source")
+                and isinstance(job.get("artifacts_digest"),str)
+                and job.get("artifacts_digest")==build.get("artifacts_digest")
                 and _fingerprint(job["config"]) == _fingerprint(config)
                 and job["config"].get("local_port") == self.port
                 and job.get("base_url", self.base_url) == self.base_url)
 
     def _require_build(self, config):
         marker = _read_json(self.state_dir / "build.json", {})
-        if marker.get("config_fingerprint") != _fingerprint(config) or marker.get("commit") != WDA_COMMIT:
+        if (marker.get("config_fingerprint") != _fingerprint(config) or marker.get("commit") != WDA_COMMIT
+                or marker.get("network_policy") != NETWORK_POLICY):
             raise ValueError("Run build successfully for this configuration before start; start uses test-without-building.")
+        source=self._loopback_source(config)
+        if not marker.get("artifacts_digest") or marker["artifacts_digest"]!=self._build_artifacts(source):
+            raise ValueError("Built WDA artifacts changed or were not verified. Rebuild before start; no service was stopped or launched.")
+        return source
+
+    def _derived_data(self,source=None):
+        if source is None:source=_read_json(self.state_dir/"build.json",{}).get("loopback_source")
+        root=self.state_dir/"derived_data"
+        if source is not None:
+            stage=Path(source)
+            if stage.parent==self.state_dir/"runtime" and stage.name.startswith("wda-loopback-"):
+                return root/stage.name
+        return root
+
+    def _build_artifacts(self,source=None):
+        """Bind runnable products and XCTest configuration to the successful build."""
+        products=self._derived_data(source)/"Build/Products"
+        for ancestor in (products,*products.parents):
+            if ancestor==self.state_dir:break
+            if ancestor.is_symlink():raise ValueError("WDA build artifacts must not use symlinks.")
+        if not products.is_dir():raise ValueError("WDA build artifacts are missing.")
+        manifest={}
+        for directory,dirs,files in os.walk(products,followlinks=False):
+            for name in dirs+files:
+                path=Path(directory)/name
+                if path.is_symlink():raise ValueError("WDA build artifacts must not use symlinks.")
+                if path.is_dir():continue
+                if not path.is_file():raise ValueError("Unsupported WDA build artifact.")
+                digest=hashlib.sha256()
+                with path.open("rb") as stream:
+                    before=os.fstat(stream.fileno())
+                    while chunk:=stream.read(1024*1024):digest.update(chunk)
+                    after=os.fstat(stream.fileno())
+                current=path.stat()
+                if (before.st_ino,before.st_size,before.st_mtime_ns)!=(after.st_ino,after.st_size,after.st_mtime_ns) or current!=after:
+                    raise ValueError("WDA build artifacts changed during verification.")
+                manifest[str(path.relative_to(products))]=[digest.hexdigest(),before.st_mode&0o777]
+        if not any(name.endswith(".xctestrun") for name in manifest) or not any("-Runner.app/" in name for name in manifest):
+            raise ValueError("WDA runner or XCTest configuration is missing from build artifacts.")
+        return _fingerprint(manifest)
 
     @staticmethod
     def _publishing_pid(job):
@@ -433,6 +637,7 @@ class SetupManager:
             with self._lock():
                 config = self.config
                 self._validate_config(config)
+                self._require_build(config)
                 jobs = self._jobs()
                 recoveries = [job for job in jobs if job.get("action") == "recover" and self._matching_job(job, config)]
                 for job in reversed(recoveries):
@@ -461,8 +666,6 @@ class SetupManager:
                     return {"ok": False, "error": "The current WDA listener is not uniquely owned by a matching live plugin start job; automatic recovery refused.",
                             "recovery": {"state": "manual"},
                             "next_steps": ["Preserve external WDA services. Ask their owner to restart them, or inspect pua_setup status and start a service owned by this plugin."]}
-                self._source(config)
-                self._require_build(config)
                 if sys.platform != "darwin" or not all(shutil.which(name) for name in ("xcodebuild", "node", "npm")):
                     raise ValueError("Recovery requires macOS, full Xcode and supported Node.js / npm.")
                 if not _node_supported(_run(["node", "--version"])["stdout"]):
@@ -531,13 +734,24 @@ class SetupManager:
         if job.get("state") in ACTIVE_STATES and not (self._publishing_pid(job) or self._owned(job)):
             result["state"] = "interrupted"
             result["error"] = "The recorded worker no longer exists or its ownership cannot be verified. Start a new job; no unrelated process was signalled."
-        log = self.state_dir / "logs" / (job["id"] + ".log")
-        try:
-            with log.open("rb") as stream:
-                stream.seek(max(0, log.stat().st_size - 12000))
-                tail = stream.read().decode("utf-8", "replace")
-        except OSError:
-            tail = ""
+        job_id = job.get("id")
+        log = self.state_dir / "logs" / (str(job_id) + ".log")
+        tail = ""
+        if isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{32}", job_id):
+            fd = None
+            try:
+                fd = os.open(log, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+                info = os.fstat(fd)
+                if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    with os.fdopen(fd, "rb") as stream:
+                        fd = None
+                        stream.seek(max(0, info.st_size - 12000))
+                        tail = stream.read().decode("utf-8", "replace")
+            except OSError:
+                tail = ""
+            finally:
+                if fd is not None:
+                    os.close(fd)
         result.pop("owner_token", None)
         result.pop("config", None)
         result.pop("recovery_target", None)
@@ -560,12 +774,17 @@ class SetupManager:
                 if action == "recover" and recovery_target and job["id"] == recovery_target["id"]:
                     continue
                 if action == "start" and job["action"] == "start":
+                    if not self._matching_job(job,config):
+                        raise ValueError("Running owned WDA does not match the verified loopback build; it was preserved.")
                     return {"ok": True, "already_running": True, "job": self._job_status(job)}
                 raise ValueError(f"An owned {job['action']} job is already running. Check status or stop that job before {action}.")
         job_id = uuid.uuid4().hex
         job = {"id": job_id, "action": action, "state": "queued", "created_at": _now(),
                "owner_token": uuid.uuid4().hex, "pid": None, "config": config,
                "worker_entrypoint": str(Path(__file__).resolve()), "base_url": self.base_url}
+        if action in ("start","recover"):
+            build=_read_json(self.state_dir/"build.json",{})
+            job.update(network_policy=NETWORK_POLICY,loopback_source=build.get("loopback_source"),artifacts_digest=build.get("artifacts_digest"))
         if recovery_target is not None:
             job.update(recovery_of=recovery_target["id"], recovery_target=recovery_target, recovery_phase="queued")
         path = self._job_path(job_id)
@@ -573,6 +792,7 @@ class SetupManager:
         log_path = self.state_dir / "logs" / (job_id + ".log")
         fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         env = {key: value for key, value in os.environ.items() if key in {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "DEVELOPER_DIR", "USER", "LOGNAME"}}
+        env.update(IPHONE_USE_ANALYTICS="0",DO_NOT_TRACK="1")
         try:
             with os.fdopen(fd, "wb") as log:
                 process = subprocess.Popen([sys.executable, job["worker_entrypoint"], "--worker", str(self.state_dir), job_id, job["owner_token"], "--base-url", self.base_url],
@@ -588,7 +808,7 @@ class SetupManager:
     def _build_command(self, config, action):
         return ["xcodebuild", "-project", str(Path(config["source_dir"]) / "WebDriverAgent.xcodeproj"),
                 "-scheme", "WebDriverAgentRunner", "-configuration", "Debug", "-destination", "id=" + config["udid"],
-                "-derivedDataPath", str(self.state_dir / "derived_data"), "-allowProvisioningUpdates",
+                "-derivedDataPath", str(self._derived_data(config["source_dir"])), "-allowProvisioningUpdates",
                 "DEVELOPMENT_TEAM=" + config["team_id"], "CODE_SIGN_STYLE=Automatic", "CODE_SIGN_IDENTITY=Apple Development",
                 "PRODUCT_BUNDLE_IDENTIFIER=" + config["bundle_id"], "USE_PORT=" + str(config["device_port"]), action]
 
@@ -698,8 +918,12 @@ class SetupManager:
                 if action == "start":
                     healthy = self._probe_status()
                     if healthy["ready"]:
+                        owned=next((job for job in self._jobs() if job.get("state") in ACTIVE_STATES
+                                    and self._matching_job(job,config) and self._owns_listener(job)),None)
+                        if not owned:raise ValueError("Refusing an unverified external WDA service; its device listener policy is unknown. The service is preserved.")
+                        self._require_build(config)
                         return {"ok": True, "already_ready": True, "service": healthy,
-                                "note": "Reusing reachable WDA. This plugin does not own or stop that external service."}
+                                "note": "Reusing the owned service with a verified loopback build."}
                     self._require_build(config)
                     if not shutil.which("node") or not shutil.which("npm"):
                         raise ValueError("Install supported Node.js and npm for the USB forward.")
@@ -738,9 +962,9 @@ def _worker(state_dir, job_id, owner_token, base_url):
     log_lock = threading.Lock()
     stopping = False
 
-    def launch(argv, cwd=None):
+    def launch(argv, cwd=None, env=None):
         """Redact command output before it reaches the private on-disk log."""
-        child = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+        child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, errors="replace", bufsize=1)
         children.append(child)
@@ -808,13 +1032,22 @@ def _worker(state_dir, job_id, owner_token, base_url):
                 # A failed rebuild must not leave an old success marker usable.
                 with contextlib.suppress(FileNotFoundError):
                     (manager.state_dir / "build.json").unlink()
-                run(manager._build_command(config, "build-for-testing"), cwd=source)
-                _write_json(manager.state_dir / "build.json", {"config_fingerprint": _fingerprint(config), "commit": WDA_COMMIT, "built_at": _now()})
+                source=manager._loopback_source(config,create=True)
+                run(manager._build_command(dict(config,source_dir=str(source)), "build-for-testing"), cwd=source)
+                # Recheck the exact patched bytes after the build too.
+                manager._loopback_source(config,source=source)
+                _write_json(manager.state_dir / "build.json", {"config_fingerprint": _fingerprint(config), "commit": WDA_COMMIT,
+                            "network_policy":NETWORK_POLICY,"loopback_source":str(source),
+                            "artifacts_digest":manager._build_artifacts(source),"built_at": _now()})
             else:
+                # Validate patched bytes before stopping or launching anything.
+                source=manager._require_build(config)
+                if (job.get("network_policy")!=NETWORK_POLICY or job.get("loopback_source")!=str(source)
+                        or job.get("artifacts_digest")!=_read_json(manager.state_dir/"build.json",{}).get("artifacts_digest")):
+                    raise ValueError("Queued service no longer matches the verified loopback build. No service was stopped or launched.")
                 if action == "recover":
                     # /status.ready cannot verify XCTest authorization. This
                     # path deliberately never uses start's healthy shortcut.
-                    manager._require_build(config)
                     job["recovery_phase"] = "stopping"
                     _write_json(path, job)
                     manager._stop_recovery_target(job)
@@ -829,11 +1062,25 @@ def _worker(state_dir, job_id, owner_token, base_url):
                 if _read_json(forward / "installed.json", {}).get("lock_hash") != lock_hash or not (forward / "node_modules/appium-ios-device").is_dir():
                     run(["npm", "ci", "--ignore-scripts", "--omit=optional", "--no-audit", "--no-fund"], cwd=forward)
                     _write_json(forward / "installed.json", {"lock_hash": lock_hash})
-                forward_child = launch(["node", str(forward / "forward.mjs"), config["udid"], str(config["local_port"]), str(config["device_port"])])
+                # Dependency preparation may take minutes. Revalidate immediately
+                # before opening either device channel, including the queued proof.
+                source=manager._require_build(config)
+                if (job.get("loopback_source")!=str(source)
+                        or job.get("artifacts_digest")!=_read_json(manager.state_dir/"build.json",{}).get("artifacts_digest")):
+                    raise ValueError("Queued service no longer matches the verified build. No device process was launched.")
+                from wda_tls import ensure
+                tls_dir = ensure(manager.state_dir)
+                forward_env = os.environ.copy()
+                forward_env["IPHONE_USE_TLS_DIR"] = str(tls_dir)
+                forward_child = launch(["node", str(forward / "forward.mjs"), config["udid"], str(config["local_port"]), str(config["device_port"])], env=forward_env)
                 time.sleep(0.15)
                 if forward_child.poll() is not None:
                     raise RuntimeError("USB forward failed to start; inspect the log tail.")
-                xcode = launch(manager._build_command(config, "test-without-building"), source)
+                verified_source=manager._require_build(config)
+                if (verified_source!=source
+                        or job.get("artifacts_digest")!=_read_json(manager.state_dir/"build.json",{}).get("artifacts_digest")):
+                    raise ValueError("Queued service changed during forward startup. No Xcode process was launched.")
+                xcode = launch(manager._build_command(dict(config,source_dir=str(source)), "test-without-building"), source)
                 next_status_probe = 0
                 # Keep both children owned and watch either side fail.
                 while not stopping and all(child.poll() is None for child in (forward_child, xcode)):

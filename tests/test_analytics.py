@@ -45,7 +45,8 @@ class AnalyticsTests(unittest.TestCase):
 
     def test_opt_out_and_missing_token_do_not_create_identity_or_worker(self):
         for setting in ({"IPHONE_USE_ANALYTICS": "0"}, {"DO_NOT_TRACK": "1"},
-                        {"IPHONE_USE_ANALYTICS": "false"}):
+                        {"IPHONE_USE_ANALYTICS": "false"},
+                        {"IPHONE_USE_ANALYTICS": "", "DO_NOT_TRACK": ""}):
             with patch.dict(os.environ, setting):
                 analytics = self.analytics()
                 self.assertFalse(analytics.capture("iphone_use_session_started"))
@@ -111,7 +112,7 @@ class AnalyticsTests(unittest.TestCase):
         self.assertNotIn("private", json.dumps(self.events))
 
     def test_runtime_and_delivery_failures_preserve_phone_results(self):
-        runtime = Runtime(self.directory)
+        runtime = Runtime(self.directory, safety_mode="standard")
         runtime.analytics = self.analytics(Mock(side_effect=OSError("offline")))
         self.addCleanup(runtime.close)
         value = {"input_complete": True, "secret": "private"}

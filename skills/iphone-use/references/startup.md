@@ -1,5 +1,7 @@
 # 启动与恢复
 
+本地 `read-only` / `strict` 模式优先于下面流程：仅允许 setup status，禁止自动 fetch、configure、build、start、stop、设备发现与服务恢复。服务未运行时报告阻塞，不通过 shell、脚本或更改安全模式绕过。部署需要用户另行明确授权。
+
 READY 没有返回 `ready=true` 时按返回的状态继续，不把这次结果当作整个任务失败，也不重放可能已经生效的业务动作。只读、禁止启动 / 重启等用户限制始终保留。
 
 ## 本对话首次使用
@@ -14,7 +16,7 @@ start 默认最多等待 20 秒，服务就绪或工作结束时提前返回，�
 
 1. 调用 `pua_setup(action="status")` 查看 `configured`、`service` 和 `jobs`。
 2. 已有与当前配置 / endpoint 对应的 start / recover 工作为 queued 或 running 时，记录其 `id`，用 `pua_setup(action="status", job_id=..., wait_seconds=20)` 查询同一工作；从返回的 `jobs` 数组匹配 id，不复用旧的无关工作。恢复到 `recovery_phase="serving"` 或启动服务达到 `service.ready=true` 后重新调用 READY，长期 Runner 可以保持 running，不等 succeeded，也不再 start。若对应 fetch / build 工作正在运行，先复用并查询该工作，再继续缺失步骤。
-3. `configured=true`、服务未就绪且没有可复用的活动工作时，调用一次 `pua_setup(action="start")`，复用现有签名构建。根据实际返回记录新工作的 `job_id`，或 `already_running=true` 时的 `job.id`，再查询同一工作。只在返回明确提示源代码 / 构建缺失或失效时按 `iphone-use-setup` 补 fetch / build；不因服务未启动先重建、重新签名或重装。若 `service.ready=true`，直接重验 READY，无需 start。
+3. `read-only` / `strict` 不执行本步：服务未运行就报告阻塞并停止，不改安全模式。仅当用户自己已设 `IPHONE_USE_SAFETY_MODE=standard`，且 `configured=true`、服务未就绪、没有可复用的活动工作时，调用一次 `pua_setup(action="start")`，复用现有签名构建。根据实际返回记录新工作的 `job_id`，或 `already_running=true` 时的 `job.id`，再查询同一工作。只在返回明确提示源代码 / 构建缺失或失效时按 `iphone-use-setup` 补 fetch / build；不因服务未启动先重建、重新签名或重装。若 `service.ready=true`，直接重验 READY，无需 start。
 4. `configured=false` 时读取 `iphone-use-setup`，按实际缺项完成 doctor / discover、fetch、configure、build / start。真实 USB、Xcode、信任、开发者模式或签名阻塞才转入对应处理；用户本人需解锁、登录或确认时用 [认证接管](authentication.md) 的提问流程。
 5. READY 返回 `ready=true` 后复用它的 observation 继续原任务。缺项需用户完成或存在真实启动失败时才报告准确阻塞。
 

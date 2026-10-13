@@ -196,7 +196,7 @@ class ToolLoadingTests(unittest.TestCase):
             {"steps": [first, {"op": "tap", "args": {"selector": {"label": "继续", "rect": {}}}}]},
         ]
         with tempfile.TemporaryDirectory() as directory:
-            runtime = Runtime(directory)
+            runtime = Runtime(directory, safety_mode="standard")
             self.addCleanup(runtime.close)
             with patch.object(runtime, "_call") as execute, patch.object(runtime.client, "request") as request:
                 for arguments in invalid_cases:

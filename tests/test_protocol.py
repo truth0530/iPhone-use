@@ -41,7 +41,7 @@ class ProtocolTests(unittest.TestCase):
         return [json.loads(line) for line in process.stdout.splitlines()]
 
     def runtime(self):
-        runtime = Runtime(self.directory.name)
+        runtime = Runtime(self.directory.name, safety_mode="standard")
         self.addCleanup(runtime.close)
         client = FakeWDA()
         runtime.client = client
@@ -309,7 +309,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(all(not item["verified"] for item in result["results"]))
         self.assertEqual(client.elements[0]["value"], text)
         self.assertEqual(client.swipe_count, 1)
-        self.assertFalse(any(path.startswith("/source") or path in ("/screenshot", "/wda/activeAppInfo")
+        self.assertTrue(any(path == "/element/active" for _, path, _ in client.calls))
+        self.assertFalse(any(path.startswith("/source") or path == "/screenshot"
                              or path.endswith("/attribute/value") for _, path, _ in client.calls))
 
     def test_batch_explicit_progress_check_stops_after_no_progress(self):

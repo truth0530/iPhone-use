@@ -28,6 +28,7 @@ class Benchmark:
     def __init__(self, runtime, module):
         self.runtime, self.module, self.error = runtime, module, module.WDAError
         self.tasks = []
+        self.unmeasured_errors = []
 
     def call(self, task, tool, arguments, measured=True):
         """Run one tool; charge its time, requests and model-facing bytes to the task."""
@@ -39,6 +40,8 @@ class Benchmark:
             data, error = {"error": exc.as_dict()}, exc.code
         seconds = time.monotonic() - started
         after = client.metrics()
+        if error and not measured:
+            self.unmeasured_errors.append({"tool": tool, "error": error})
         if measured:
             content = self.module.result_content(data)["content"]
             task["calls"] += 1
@@ -59,7 +62,7 @@ class Benchmark:
 
     def scroll_back(self, count):
         for _ in range(count):
-            self.call(None, "pua_swipe", {"direction": "down"}, measured=False)
+            if "error" in self.call(None, "pua_swipe", {"direction": "down"}, measured=False):break
 
     def ready(self):
         task = self.task("ready")
@@ -68,13 +71,13 @@ class Benchmark:
 
     def open_and_read(self):
         task = self.task("open_app_read_page")
-        data = self.call(task, "pua_launch_app", {"bundle_id": SETTINGS, "observe": "tree"})
+        data = self.call(task, "pua_launch_app", {"bundle_id": SETTINGS, "observe": "tree", "verify": True})
         task["nodes"] = data.get("observation", {}).get("total_nodes")
 
     def scroll_pages(self, pages):
         task = self.task(f"scroll_{pages}_pages")
         for _ in range(pages):
-            self.call(task, "pua_swipe", {"direction": "up", "observe": "tree"})
+            if "error" in self.call(task, "pua_swipe", {"direction": "up", "observe": "tree"}):return
         self.scroll_back(pages)
 
     def collect(self, pages):
@@ -86,21 +89,27 @@ class Benchmark:
     def long_text(self, characters):
         task = self.task(f"type_{characters}_characters")
         text = (PHRASE * (characters // len(PHRASE) + 1))[:characters]
-        if not self.call(task, "pua_find", {"selector": SEARCH}).get("matches"):
+        found = self.call(task, "pua_find", {"selector": SEARCH})
+        if "error" in found:return
+        if not found.get("matches"):
             # Older layouts reveal the search field only after pulling the list down.
-            self.call(task, "pua_swipe", {"direction": "down"})
-            if not self.call(task, "pua_find", {"selector": SEARCH}).get("matches"):
+            if "error" in self.call(task, "pua_swipe", {"direction": "down"}):return
+            found = self.call(task, "pua_find", {"selector": SEARCH})
+            if "error" in found:return
+            if not found.get("matches"):
                 task["skipped"] = "no search field on this page"
                 return
-        started = time.monotonic()
         data = self.call(task, "pua_type_text", {"selector": SEARCH, "text": text, "verify": True})
         while data.get("input_complete") is False:
             data = self.call(task, "pua_type_text", {"continue_token": data["continue_token"]})
         task["exact_readback"] = data.get("exact_readback", False)
         if "error" in data:
-            # A request that timed out leaves the phone typing; let it finish before cleaning up.
-            time.sleep(max(0.0, characters / 30 + 3 - (time.monotonic() - started)))
+            # The target or request outcome may be uncertain: never clear a different field.
+            return
         try:
+            if self.runtime.phone.active_app() != SETTINGS:
+                task["cleanup_error"] = "input_target_changed"
+                return
             path = self.runtime.phone.target(SEARCH, editable=True)
             self.runtime.phone.post(path + "/clear", {})
         except self.error as exc:
@@ -115,13 +124,18 @@ class Benchmark:
     def run(self, pages=10, characters=600, collect_pages=6):
         if not self.ready():
             return self.summary(complete=False)
-        self.open_and_read()
-        self.scroll_pages(pages)
-        self.collect(collect_pages)
-        self.long_text(characters)
-        self.screenshot()
-        self.call(None, "pua_press_button", {"name": "home"}, measured=False)
-        return self.summary(complete=True)
+        for operation, args in ((self.open_and_read, ()), (self.scroll_pages, (pages,)),
+                                (self.collect, (collect_pages,)), (self.long_text, (characters,)),
+                                (self.screenshot, ())):
+            operation(*args)
+            if not self.successful():return self.summary(complete=False)
+        self.call(None, "pua_press_button", {"name": "home", "verify": True}, measured=False)
+        return self.summary(complete=self.successful())
+
+    def successful(self):
+        return not self.unmeasured_errors and all(
+            not task["errors"] and not task.get("skipped") and not task.get("cleanup_error")
+            and task.get("exact_readback", True) is True for task in self.tasks)
 
     def summary(self, complete):
         totals = {key: round(sum(task[key] for task in self.tasks), 3)
@@ -129,6 +143,7 @@ class Benchmark:
         endpoints = {name: {key: value for key, value in entry.items() if key in ("count", "seconds", "bytes")}
                      for name, entry in self.runtime.client.metrics().get("endpoints", {}).items()}
         return {"plugin_version": getattr(self.module, "VERSION", "unknown"), "complete": complete,
+                "unmeasured_errors": self.unmeasured_errors,
                 "tasks": self.tasks, "totals": totals, "http_endpoints": endpoints,
                 "scope": "Tool layer on one device and page set. Model latency and round trips are not included."}
 

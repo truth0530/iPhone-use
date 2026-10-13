@@ -21,7 +21,7 @@ class BenchmarkTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.runtime = iphone_use.Runtime(self.directory.name)
+        self.runtime = iphone_use.Runtime(self.directory.name, safety_mode="standard")
         self.addCleanup(self.runtime.close)
         self.client = FakeWDA()
         self.client.close = lambda: None
@@ -71,6 +71,46 @@ class BenchmarkTests(unittest.TestCase):
                 patch.object(sys, "stderr"):
             benchmark.main()
         self.assertEqual(stopped.exception.code, 2)
+
+    def test_task_errors_skips_and_failed_readback_never_report_complete(self):
+        for failure in ("tool_error", "skipped", "readback", "cleanup"):
+            with self.subTest(failure=failure):
+                if failure == "tool_error":
+                    mocked = patch.object(self.runtime.phone, "launch_app", side_effect=iphone_use.WDAError("fake_error", "Failed launch"))
+                elif failure == "skipped":
+                    mocked = patch.object(self.runtime.phone, "find", return_value={"matches": []})
+                elif failure == "readback":
+                    mocked = patch.object(self.runtime.phone, "type_text", return_value={"exact_readback": False})
+                else:
+                    original = self.runtime.phone.post
+                    clears = 0
+                    def post(path, payload, **kwargs):
+                        nonlocal clears
+                        if path.endswith("/clear"):
+                            clears += 1
+                            if clears == 2:raise iphone_use.WDAError("fake_error", "Failed cleanup")
+                        return original(path, payload, **kwargs)
+                    mocked = patch.object(self.runtime.phone, "post", side_effect=post)
+                before = len(self.client.actions())
+                with mocked:
+                    result = benchmark.Benchmark(self.runtime, iphone_use).run(pages=1, characters=10, collect_pages=1)
+                self.assertFalse(result["complete"])
+                self.assertFalse(any(path == "/wda/homescreen" for _, path, _ in self.client.actions()[before:]))
+                if failure == "tool_error":
+                    self.assertEqual([task["task"] for task in result["tasks"]], ["ready", "open_app_read_page"])
+
+    def test_unmeasured_home_and_scroll_restoration_errors_are_reported(self):
+        for tool in ("pua_press_button", "pua_swipe"):
+            with self.subTest(tool=tool):
+                original = self.runtime.call
+                def call(name, args):
+                    if name == tool and (tool == "pua_press_button" or args.get("direction") == "down"):
+                        raise iphone_use.WDAError("fake_error", "Fake restoration failure")
+                    return original(name, args)
+                with patch.object(self.runtime, "call", side_effect=call):
+                    result = benchmark.Benchmark(self.runtime, iphone_use).run(pages=1, characters=10, collect_pages=1)
+                self.assertFalse(result["complete"])
+                self.assertIn({"tool": tool, "error": "fake_error"}, result["unmeasured_errors"])
 
 
 if __name__ == "__main__":

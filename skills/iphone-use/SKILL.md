@@ -1,15 +1,19 @@
 ---
 name: iphone-use
-description: 通过 PUA（Phone Use Agent）MCP 工具高效操作真实 iPhone；本对话首次使用先直接 setup 检查并启动服务，再取得 READY，服务未启动时沿 setup 启动流程继续。默认乐观执行导航、点击、输入和滚动，在下一步观察时顺带判断进度，只对关键最终结果显式验收；指导 App 查找、列表采集、手机屏幕侧边栏及密码或 Face ID 认证接管。
+description: 通过 PUA MCP 按当前安全模式操作真实 iPhone。默认 read-only 只调用 setup status 和读取，不启动服务、不点击、不输入。用户自己把 IPHONE_USE_SAFETY_MODE 设为 standard 之后才走启动和操作流程。正常返回不证明业务成功。
 ---
 
 # 用 PUA 完成 iPhone 任务
 
+本地默认 `IPHONE_USE_SAFETY_MODE=read-only`，只允许读取；`strict` 同样只允许读取，所有点击、输入、续写、滑动、启动应用和按键都由用户手动执行。选择器验证无法证明发送/支付/删除安全；键盘焦点检查无法消除输入竞态。禁止自动安装、签名和服务恢复。不要改成 `standard` 或用 shell / 直接控制器绕过策略。先遵守当前模式，再参考下文启动流程；安全模式下服务未运行就报告阻塞，不能自行启动。分析保持 `IPHONE_USE_ANALYTICS=0` 与 `DO_NOT_TRACK=1`。
+
+MCP 使用 `server/isolated.py`：macOS 沙箱禁止 MCP 直接联网、shell 和 USB socket；独立只读中介通过私有继承通道，仅把允许的查询传到固定 loopback 端点，不能更换地址。中介故障时禁止 HTTP 降级。MCP 只写会话、观察状态和截图，不能修改构建记录、二进制、生命周期配置或 USB 中继代码。无法隔离时禁止启动。隔离入口固定只读并清除注入环境。不要绕过入口直接执行原服务。沙箱仅覆盖这些子进程，不覆盖宿主 AI 的其他 shell；默认隔离禁止自动 USB MJPEG 子进程，需要画面时用 `pua_observe(mode=screenshot)`。只采用用户手动建立的 PUA session，不自动替换。底层测试服务构建从校验过的固定源码生成独立 loopback 副本，HTTP/MJPEG 均固定到 `127.0.0.1`；启动前复核构建产物哈希与执行权限，改变、缺失或旧构建均拒绝，未知外部服务不能自动复用。源码和合成构建测试不等于实机网络测试通过。
+
 新对话没有本对话的有效 READY 证明时，先执行下面的初始化流程，再开始手机任务；此前聊天成功、安装了插件、打开 widget 或看到 Runner 图标都不替代本对话 READY。PUA 服务尚未启动是需要继续处理的启动步骤，不能据此提前结束用户任务。已有配置默认复用，只启动缺失服务，不整套重装。
 
-先确定用户要交付的结果和完成条件。默认把一次正常返回的动作当作已按计划执行，继续准备下一步；不要为每次点击、切页、Home、启动或输入专门调用观察来证明成功。下一步需要页面信息时，读取一次并顺带判断上一步是否生效；明确未生效再调整或重做。最终关键操作、发送或提交结果、关键文本以及交付文件需要有实际结果证据。
+先确定用户要交付的结果和完成条件。正常返回只证明请求已处理，不证明手机界面或业务结果正确。依赖动作结果前，检查新观察或显式验证；不能从 `ok`、`action_complete` 推断成功。下一步需要页面信息时，读取一次并顺带判断上一步是否生效；明确未生效再调整或重做。最终关键操作、发送或提交结果、关键文本以及交付文件需要有实际结果证据。
 
-工具的 `ok`、`verified`、`complete` 及宿主的 completed 只描述对应调用，不代表整个任务完成。`action_complete` 表示该命令处理完毕，不是业务结果已验收。正常返回的 `verified=false` 表示没有单独验收，不是失败，也不要求停下。按已知路径继续，直到全部完成条件满足、关键结果已核对并完成交付；不能用“接下来读取……”提前结束。较长任务持续给出简短进度。
+工具的 `ok`、`verified`、`complete` 及宿主的 completed 只描述对应调用，不代表整个任务完成。`action_complete` 表示该命令处理完毕，不是业务结果已验收。正常返回的 `verified=false` 表示结果尚未验收；依据新状态继续，直到全部完成条件满足、关键结果已核对并完成交付；不能用“接下来读取……”提前结束。较长任务持续给出简短进度。
 
 ## READY 与认证
 
@@ -27,7 +31,7 @@ App 实际要求密码、PIN、验证码、Face ID / Touch ID，或手机需要�
 
 ## 按下一步需要选择观察
 
-已知唯一语义目标和已知导航路径使用默认 `observe="none"`，可以连续执行或合并为 batch。下一步需要辨认未知页面、选区域或读取内容时，在本次动作直接设置 `observe="tree" / "screenshot" / "both"`，用返回的嵌套 `observation` 同时规划下一步和顺带判断上一动作。不要先用 none，再专门 observe 作验证而增加一个模型回合。独立读取用 `pua_observe(mode=...)`，不要混用 mode 与 observe。
+按当前安全模式执行；严格模式请求 `observe="both"` 并验证，点击还需要明确 `expect`。不要把未验收的连续动作合并为成功结论。下一步需要辨认未知页面、选区域或读取内容时，在本次动作直接设置 `observe="tree" / "screenshot" / "both"`，用返回的嵌套 `observation` 同时规划下一步和顺带判断上一动作。不要先用 none，再专门 observe 作验证而增加一个模型回合。独立读取用 `pua_observe(mode=...)`，不要混用 mode 与 observe。
 
 树的每个节点只保留一份事实：`type` 不带 `XCUIElementType` 前缀，`rect` 是 `[x, y, width, height]`（iPhone 点）；没有 `name` 表示它与 `label` 相同，没有 `value` 表示它与文字相同，没有 `enabled` / `visible` / `in_viewport` 表示为 true。保持 `include_invisible=false`、`max_nodes=200`、`expensive_visibility=false`；只查一个目标用 `pua_find` / `pua_wait`，不重复获取整树。树截断或节点在视口内不能证明内容全量或目标未被遮挡，固定表头和浮层可能盖住它。
 

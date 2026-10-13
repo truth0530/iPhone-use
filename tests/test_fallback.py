@@ -31,7 +31,7 @@ class FallbackTests(unittest.TestCase):
         self.setup_manager = None
 
     def make_runtime(self, state_dir, base_url):
-        runtime = Runtime(state_dir, base_url)
+        runtime = Runtime(state_dir, base_url, safety_mode="standard")
         runtime.client.close()
         self.client.close = lambda: setattr(self, "closed", True)
         runtime.client = self.client

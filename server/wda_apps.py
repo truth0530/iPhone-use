@@ -121,7 +121,7 @@ class AppCatalog:
         if any((ancestor / ".git").exists() for ancestor in (self.state_dir, *self.state_dir.parents)):
             raise ValueError("App inventory/cache state must stay outside Git checkouts.")
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.state_dir.chmod(0o700)
+        if self.state_dir.stat().st_mode&0o777!=0o700:self.state_dir.chmod(0o700)
         self.setup_manager = setup_manager
 
     @staticmethod

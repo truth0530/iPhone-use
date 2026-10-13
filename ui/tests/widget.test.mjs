@@ -14,6 +14,15 @@ const preview = (fields = {}) => ({ server_time: 1000, frame: null, viewport: nu
 // Fixtures exist only in this isolated DOM test, never in the shipped widget.
 const frame = (seq = 1) => ({ seq, data: 'test-image-only', mimeType: 'image/png', width: 900, height: 1800 });
 
+test('cached frames with unavailable capture remain offline through successful polls', async () => {
+  const h = await harness({ reply: () => ({ structuredContent: preview({ frame_available: false, frame: frame() }) }) });
+  h.app.ontoolresult({ structuredContent: preview({ frame_available: true, frame: frame() }) });
+  assert.equal(h.elements.app.dataset.live, 'live');
+  for (let i = 0; i < 10; i++) await h.tick();
+  assert.equal(h.elements.app.dataset.live, 'offline');
+  assert.equal(h.imageWrites, 1);
+});
+
 async function harness({ reducedMotion = false, context = { displayMode: 'inline', availableDisplayModes: ['fullscreen'] }, reply, connectReply } = {}) {
   let now = 0;
   let timerId = 0;

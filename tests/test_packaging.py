@@ -62,7 +62,7 @@ class PackagingTests(unittest.TestCase):
         for name in ('assets/phone-screen.html', 'tooling/screen-stream.mjs', 'tooling/forward.mjs',
                      'tooling/package-lock.json', 'scripts/phone.py', 'scripts/check_screen_ui.py'):
             self.assertEqual((self.stage / name).read_bytes(), (ROOT / name).read_bytes(), name)
-        for document in list((self.stage / 'skills').rglob('*.md')) + [self.stage / 'README.md', self.stage / 'README.en.md', self.stage / 'CHANGELOG.md']:
+        for document in list((self.stage / 'skills').rglob('*.md')) + [self.stage / 'README.md', self.stage / 'README.en.md', self.stage / 'README.zh.md', self.stage / 'CHANGELOG.md']:
             for target in re.findall(r'\]\(([^)]+)\)', document.read_text()):
                 if '://' in target or target.startswith('#'):
                     continue

@@ -196,7 +196,8 @@ class LongInputTests(PhoneCase):
         self.assertEqual(actions[-1][2], {"value": ["\n"]})
         self.assertEqual(sum(body == {"value": ["\n"]} for _, _, body in actions), 1)
         self.assertEqual(sum(path.endswith("/clear") for _, path, _ in actions), 1)
-        self.assertEqual(sum(path.endswith("/attribute/value") for path in self.paths()), 1)
+        # Continuations and submission now confirm the already typed prefix as well.
+        self.assertEqual(sum(path.endswith("/attribute/value") for path in self.paths()), 4)
         self.assert_code("input_continuation_expired", lambda: self.phone.type_text(continue_token=second["continue_token"]))
 
     def test_another_phone_action_invalidates_the_continuation(self):
@@ -275,7 +276,7 @@ class LongInputTests(PhoneCase):
 
     def test_runtime_accepts_exactly_one_form_before_any_phone_request(self):
         with tempfile.TemporaryDirectory() as directory:
-            runtime = Runtime(directory)
+            runtime = Runtime(directory, safety_mode="standard")
             self.addCleanup(runtime.close)
             runtime.client = self.client
             self.client.close = lambda: None
@@ -652,7 +653,7 @@ class ResultContentTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.runtime = Runtime(self.directory.name)
+        self.runtime = Runtime(self.directory.name, safety_mode="standard")
         self.addCleanup(self.runtime.close)
         self.client = FakeWDA()
         self.client.close = lambda: None
@@ -753,7 +754,7 @@ class ServeTests(unittest.TestCase):
 
     def test_metrics_report_response_bytes_rounds_and_waits_then_reset(self):
         with tempfile.TemporaryDirectory() as directory:
-            runtime = Runtime(directory)
+            runtime = Runtime(directory, safety_mode="standard")
             self.addCleanup(runtime.close)
             client = FakeWDA()
             client.close = lambda: None

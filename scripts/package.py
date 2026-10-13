@@ -9,7 +9,7 @@ import sys
 import zipfile
 
 ROOT=Path(__file__).resolve().parents[1]
-FILES=('plugin.json','mcp.json','.mcp.json','.codex-plugin/plugin.json','.agents/plugins/marketplace.json','README.md','README.en.md','ANALYTICS.md','CHANGELOG.md','LICENSE','THIRD_PARTY_NOTICES.md','ui/package.json','ui/package-lock.json','ui/build.mjs','ui/src/app.ts','ui/index.html','ui/style.css','ui/tsconfig.json','ui/tests/widget.test.mjs')
+FILES=('plugin.json','mcp.json','.mcp.json','.codex-plugin/plugin.json','.agents/plugins/marketplace.json','README.md','README.en.md','README.zh.md','ANALYTICS.md','CHANGELOG.md','LICENSE','THIRD_PARTY_NOTICES.md','ui/package.json','ui/package-lock.json','ui/build.mjs','ui/src/app.ts','ui/index.html','ui/style.css','ui/tsconfig.json','ui/tests/widget.test.mjs')
 DIRS=('assets','server','skills')
 INSTALL_SCRIPTS=('phone.py','wda.sh','update_app_catalog.py','check_screen_ui.py','package.py','install.sh','register_mcp.py')
 SOURCE_DIRS=('scripts','tests','.github')
@@ -47,7 +47,7 @@ def validate():
     assert portable['mcpServers']==legacy['mcpServers']
     assert list(portable['mcpServers'])==['iphone_use']
     for config in portable['mcpServers'].values():
-        assert config['type']=='stdio' and config['args']==['${PLUGIN_ROOT}/server/iphone_use.py']
+        assert config['type']=='stdio' and config['args']==['-I','-S','-B','${PLUGIN_ROOT}/server/isolated.py']
     for skill in ('iphone-use','iphone-use-setup'):
         path=ROOT/'skills'/skill/'SKILL.md';body=path.read_text()
         assert body.startswith('---\n') and re.search(r'^name: '+skill+r'$',body,re.M) and re.search(r'^description: .+',body,re.M)

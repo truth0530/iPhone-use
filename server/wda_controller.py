@@ -2,9 +2,11 @@
 import base64
 import collections
 import datetime as dt
+import errno
 from functools import wraps
 import json
 import math
+import os
 from pathlib import Path
 import re
 import time
@@ -62,6 +64,8 @@ def integer(value, name, low, high):
 def action_result(function):
     @wraps(function)
     def wrapped(self,*args,**kwargs):
+        if self.read_only and function.__name__ in ("tap","swipe","type_text","launch_app","press_button","collect_list"):
+            raise WDAError("safety_policy","Phone mutations are disabled by the controller policy.",details={"action_executed":False})
         before=self.accepted_actions
         try:return function(self,*args,**kwargs)
         except WDAError as error:
@@ -148,8 +152,9 @@ def contains(outer,inner,slack=1):
 
 
 class PhoneController:
-    def __init__(self, client, state_dir):
+    def __init__(self, client, state_dir, read_only=False):
         self.client, self.state_dir = client, Path(state_dir)
+        self.read_only=read_only
         self.snapshots=collections.OrderedDict()
         self.tool_records=collections.deque(maxlen=500)
         self.accepted_actions=0
@@ -187,6 +192,8 @@ class PhoneController:
             except Exception:pass
 
     def post(self,path,payload,timeout=None,session=True):
+        if self.read_only:
+            raise WDAError("safety_policy","Phone mutations are disabled by the controller policy.",details={"action_executed":False})
         if path=="/wda/tap":self.screen_event("tap",point={"x":payload["x"],"y":payload["y"]})
         elif path.endswith("/click") and path[:-6] in self._screen_targets:
             self.screen_event("tap",point=self._screen_targets[path[:-6]])
@@ -320,8 +327,18 @@ class PhoneController:
         if not data.startswith(wda_image.PNG_SIGNATURE):
             fail("invalid_response","PUA screenshot is not PNG.")
         artifacts=self.state_dir/"artifacts";artifacts.mkdir(mode=0o700,parents=True,exist_ok=True)
-        dest=artifacts/(dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")+"-"+uuid.uuid4().hex[:8]+".png")
-        dest.write_bytes(data);dest.chmod(0o600)
+        flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0)
+        dest=None
+        for _ in range(8):
+            candidate=artifacts/(dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")+"-"+uuid.uuid4().hex[:8]+".png")
+            try:fd=os.open(candidate,flags,0o600)
+            except OSError as error:
+                if error.errno in (errno.EEXIST,errno.ELOOP):continue
+                raise
+            with os.fdopen(fd,"wb") as stream:stream.write(data)
+            dest=candidate
+            break
+        if dest is None:fail("invalid_response","Could not store the screenshot without aliasing an existing file.")
         native=wda_image.png_size(data[:32])
         if native and (native[0]>native[1])!=(viewport["width"]>viewport["height"]):
             # The capture is turned the other way than the remembered viewport: the phone rotated.
@@ -358,6 +375,8 @@ class PhoneController:
 
     def query(self,selector,limit=CANDIDATE_LIMIT):
         """Matches in tree order, with whatever attributes PUA returned inline."""
+        if self.read_only and "predicate" in selector:
+            raise WDAError("safety_policy","Raw predicate expressions are disabled in observation mode.",details={"action_executed":False})
         found=self.client.session("POST","/elements",{"using":"predicate string","value":predicate(selector)}) or []
         if not isinstance(found,list):
             fail("invalid_response","PUA elements result is not a list.")
@@ -507,6 +526,8 @@ class PhoneController:
 
     @action_result
     def wait(self,selector,timeout_seconds=6):
+        if self.read_only and "predicate" in selector:
+            raise WDAError("safety_policy","Raw predicate expressions are disabled in observation mode.",details={"action_executed":False})
         finite(timeout_seconds,"timeout_seconds",0,20)
         pred=predicate(selector)
         deadline=time.monotonic()+timeout_seconds;attempts=0
@@ -655,7 +676,9 @@ class PhoneController:
         if selector is not None:self.post(path+"/click",{})
         if replace:
             self.post(path+"/clear",{})
-        return self.type_pieces({"path":path,"focused":selector is None,"pieces":split_text(text,self.typing_piece),"typed":0,"total":len(text),
+        pieces=split_text(text,self.typing_piece)
+        binding={"session":self.client.ensure_session(),"app":self.active_app()} if len(pieces)>1 or submit else {}
+        return self.type_pieces({"path":path,"focused":selector is None,"pieces":pieces,"typed":0,"total":len(text),**binding,
                                  "expected":text if replace else str(before)+text,"verify":verify,"submit":submit,"expect":expect,"observe":observe})
 
     def focused_field(self):
@@ -674,6 +697,24 @@ class PhoneController:
             fail("not_editable","The focused element is not a readable text field. Ask the user to handle secure fields.",secure_field=kind=="XCUIElementTypeSecureTextField")
         return path,kind
 
+    def check_input_target(self,plan):
+        """Revalidate the original session, foreground app and readable focused field before keys."""
+        try:
+            if self.client.session_id != plan["session"] or self.active_app() != plan["app"]:
+                raise WDAError("input_target_changed", "The original input context changed.")
+            path,_ = self.focused_field()
+            # Reading the focus can recreate an invalid WDA session.
+            if path != plan["path"] or self.client.session_id != plan["session"]:
+                raise WDAError("input_target_changed", "The original input context changed.")
+            if plan["verify"]:
+                prefix=plan["expected"][:len(plan["expected"])-plan["total"]+plan["typed"]]
+                if (self.client.session("GET",path+"/attribute/value") or "") != prefix or self.client.session_id != plan["session"]:
+                    raise WDAError("input_target_changed", "The field contents changed between input requests.")
+        except WDAError as error:
+            self.pending_input=None
+            raise WDAError("input_target_changed", "Input stopped before sending more keys: the original session, app or readable field could not be confirmed. Inspect current state; do not resend the whole text.",
+                           details={"action_executed":False,"characters_confirmed":plan["typed"],"characters_total":plan["total"],"cause":error.code,"replay_action":False}) from error
+
     def type_pieces(self,plan):
         """Type bounded requests in order; stop at the call budget and keep the rest for a continuation."""
         deadline=time.monotonic()+self.call_budget
@@ -684,6 +725,7 @@ class PhoneController:
             piece=plan["pieces"][0]
             timeout=request_timeout(len(piece),self.typing_frequency,getattr(self.client,"timeout",15))
             try:
+                if plan["focused"] and "session" in plan:self.check_input_target(plan)
                 # The element request focuses the field once; later pieces go to that focus,
                 # because another element request may tap again and move the caret.
                 if plan["focused"]:self.post("/wda/keys",{"value":[piece],"frequency":self.typing_frequency},timeout=timeout)
@@ -706,6 +748,7 @@ class PhoneController:
                 fail("input_mismatch","Typed text did not round-trip exactly. Do not submit or blindly type it again.",expected_length=len(plan["expected"]),actual_length=len(str(actual or "")))
         result={"action_executed":True,"action_complete":True,"verified":plan["verify"],"verification_deferred":not plan["verify"],"exact_readback":plan["verify"],"characters":plan["total"],"submitted":False}
         if plan["submit"]:
+            self.check_input_target(plan)
             self.post("/wda/keys",{"value":["\n"]})
             result.update({"submitted":True,"verified":False,"verification_deferred":True,"submission_verified":False,"verification_required":"Check the final submission result before claiming task completion; do not automatically repeat submission."})
         if plan["expect"]:
@@ -893,6 +936,9 @@ class PhoneController:
         for step in steps:
             if not isinstance(step,dict) or set(step)-{"op","args"} or step.get("op") not in allowed or not isinstance(step.get("args",{}),dict):
                 fail("invalid_argument","Each batch step needs a supported op and args object.")
+            if self.read_only and (step["op"] not in ("wait","observe","scroll_find") or
+                                   (step["op"]=="scroll_find" and step.get("args",{}).get("max_swipes",1)!=0)):
+                raise WDAError("safety_policy","Batch contains a forbidden phone mutation.",details={"action_executed":False})
         results=[]
         # One call stays inside the host's tool timeout: later steps are handed back, never dropped silently.
         self._deadline=time.monotonic()+self.call_budget

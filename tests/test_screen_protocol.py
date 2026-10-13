@@ -88,7 +88,7 @@ class ScreenProtocolTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
 
     def runtime(self):
-        runtime = Runtime(self.directory.name)
+        runtime = Runtime(self.directory.name, safety_mode="standard")
         # Close the unused real preview before replacing it; no frame poll occurs.
         runtime.screen.close()
         client = FakeWDA()

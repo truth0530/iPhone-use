@@ -11,7 +11,7 @@ for capture. See the [PostHog capture API](https://posthog.com/docs/api/capture)
 
 ## Collection and controls
 
-Analytics is enabled by default. It records a random installation UUID saved
+Analytics is off unless `IPHONE_USE_ANALYTICS=1`. It then records a random installation UUID saved
 privately in the plugin's state directory, a new random process/session UUID,
 plugin version, platform, event timestamp and the bounded fields below. The
 installation UUID remains stable through upgrades that reuse the state directory.
@@ -23,8 +23,8 @@ bundle IDs, UDIDs, signing teams, filesystem paths, MCP request IDs and exceptio
 messages are never sent. Only known tools, actions, states and error codes are
 accepted; unknown errors become `other`.
 
-Set either environment variable on the MCP server and restart it to disable
-analytics completely, including local analytics identity creation:
+Leave the variable unset, or set either line below and restart, to keep analytics
+off. That includes local analytics identity creation:
 
 ```sh
 IPHONE_USE_ANALYTICS=0

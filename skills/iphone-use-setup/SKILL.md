@@ -1,12 +1,14 @@
 ---
 name: iphone-use-setup
-description: 配置 PUA（Phone Use Agent），在用户自己的 iPhone 上安装、签名并启动手机端执行服务；本对话首次使用先直接 setup，再验 READY，服务未启动时复用配置与构建启动，诊断 USB 和 Xcode 连接并打开手机屏幕侧边栏；适用于首次配置、冷启动、断线恢复或签名过期。
+description: 配置用户自己的 iPhone 上的 PUA。默认 read-only 与 strict 只允许 setup status，不 fetch、不签名、不启动。用户自己改为 standard 之后才安装并启动。用 USB 诊断 Xcode 连接，不把手机控制端口开到 Wi-Fi。
 ---
 
 # 把 iPhone 配置为 READY
 
 使用本插件的 MCP 工具完成可重复的探测、构建、启动和连接；不要在每次任务中临时生成 Python 客户端。已有可用 PUA 时先复用，避免每个任务都重建或重装。
 
+
+本地 `read-only` / `strict` 模式优先于下面流程：仅允许 setup status，禁止自动 fetch、configure、build、start、stop、设备发现与服务恢复。服务未运行时报告阻塞，不通过 shell、脚本或更改安全模式绕过。部署需要用户另行明确授权。
 ## 先确定当前状态
 
 本对话首次使用手机、尚未取得 READY 时，先直接调用 `pua_setup(action="status")`，按下节复用健康服务或活动工作，缺少服务才 start 一次；服务就绪后调用 `pua_ready(recover=true, screenshot=false)`，再执行用户手机任务。不要先 READY 失败再 setup；不以之前聊天的 READY 或已安装插件代替当前证明。本对话已 READY 且通道未失效时直接继续，不为每项任务重复 doctor、discover、build 和 start。首次配置或 READY 返回具体缺项时，使用 `pua_doctor` 与 `pua_setup(action="discover")` 读取 Xcode、已连接设备、签名、端口及进程状态。多台 iPhone 按用户提供的设备选择；只有一台符合条件时可以直接使用。设备 UDID、Team ID、日志和签名配置保存在用户本机，不写进源码或 Git。
@@ -22,7 +24,7 @@ description: 配置 PUA（Phone Use Agent），在用户自己的 iPhone 上安�
 1. 调用 `pua_setup(action="status")`。返回 `configured=true` 时保留现有设备、签名和端口配置；`configured=false` 才按下节首次安装流程补实际缺项。
 2. 检查返回 `jobs` 数组。已有与当前配置 / endpoint 对应的 start / recover 工作为 queued 或 running 时按其 `id` 查询同一工作，不重复 start，也不等待旧的无关工作；有对应 fetch / build 工作正在运行时也先复用它。`pua_setup(action="status", job_id=...)` 仍返回 `jobs` 数组，不能假定返回单个 job。
 3. `service.ready=true` 表示服务可探测，仍需重新 READY 验证 session / 前台 / 视口等完整通道。start 工作仍 running 且服务可用即可验 READY；recover 工作到 `recovery_phase="serving"` 后验 READY，长期 Runner 不等 succeeded。
-4. 已配置、服务未运行且没有对应活动工作时，调用一次 `pua_setup(action="start")` 复用有效构建。start 默认有界等待最多 20 秒，服务就绪或工作结束时提前返回；不是固定 sleep。返回 `service.ready=true` 时直接 READY，无需再查 status。尚未就绪时用 `pua_setup(action="status", job_id=..., wait_seconds=20)` 等待同一工作，超时只表示仍在启动，不能再次 start。新工作记录返回的 `job_id`；`already_running=true` 时记录 `job.id`，需要等待时用 `pua_setup(action="status", job_id=..., wait_seconds=20)` 查询同一工作。start 明确报告源代码缺失时 fetch，明确报告有效构建缺失、签名过期或二进制不兼容时 build，然后继续 start；不因冷启动先完整重装或重新签名。工作失败时查看该工作准确日志和 next_steps，再处理真实缺项，不能循环 start。
+4. `read-only` / `strict` 不执行本步，报告阻塞并停止。仅当用户自己已设 `standard`，且已配置、服务未运行、没有对应活动工作时，调用一次 `pua_setup(action="start")` 复用有效构建。start 默认有界等待最多 20 秒，服务就绪或工作结束时提前返回；不是固定 sleep。返回 `service.ready=true` 时直接 READY，无需再查 status。尚未就绪时用 `pua_setup(action="status", job_id=..., wait_seconds=20)` 等待同一工作，超时只表示仍在启动，不能再次 start。新工作记录返回的 `job_id`；`already_running=true` 时记录 `job.id`，需要等待时用 `pua_setup(action="status", job_id=..., wait_seconds=20)` 查询同一工作。start 明确报告源代码缺失时 fetch，明确报告有效构建缺失、签名过期或二进制不兼容时 build，然后继续 start；不因冷启动先完整重装或重新签名。工作失败时查看该工作准确日志和 next_steps，再处理真实缺项，不能循环 start。
 5. 取得 `ready=true` 后复用当前 observation，继续原任务。只有真实 USB / Xcode / 签名 / 权限阻塞才需要对应处理；必须用户本人解锁、信任、登录或确认时，用首个选项「已完成继续」的宿主提问流程。用户明确要求只读、禁止启动 / 重启时保留限制，不通过初始化绕过。
 
 本聊天已有 widget 时，重跑 setup、启动 / 恢复通道和再次 READY 均复用已有面板，不再额外调用 `pua_screen()` 打开新标签。用户只要求“先打开 widget 让我看”且面板尚未打开时，调用 `pua_screen()` 打开预览后继续初始化与已授权任务，不添加等待批准的关卡；用户明确要求先等确认则照做。未启动时预览暂时空白不证明 READY，也不表示整个任务已失败。

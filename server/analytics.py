@@ -68,8 +68,10 @@ def project_token():
 
 
 def opted_out():
-    return (os.environ.get("IPHONE_USE_ANALYTICS", "").lower() in ("0", "false", "off", "no")
-            or os.environ.get("DO_NOT_TRACK", "").lower() in ("1", "true"))
+    """Stats stay off unless this process explicitly opts in."""
+    if os.environ.get("DO_NOT_TRACK", "").lower() in ("1", "true"):
+        return True
+    return os.environ.get("IPHONE_USE_ANALYTICS", "").lower() not in ("1", "true", "on", "yes")
 
 
 def environment():

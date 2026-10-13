@@ -4,6 +4,7 @@ task_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$task_root"
 # Tests and package probes must never send production usage events.
 export IPHONE_USE_ANALYTICS=0
+export DO_NOT_TRACK=1
 python3 -m unittest discover -s tests -v
 python3 scripts/package.py --validate-only
 node --check tooling/forward.mjs

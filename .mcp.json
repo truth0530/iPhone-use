@@ -4,9 +4,10 @@
       "type": "stdio",
       "command": "python3",
       "args": [
-        "${PLUGIN_ROOT}/server/iphone_use.py"
+        "-I", "-S", "-B", "${PLUGIN_ROOT}/server/isolated.py"
       ],
-      "cwd": "${PLUGIN_ROOT}"
+      "cwd": "${PLUGIN_ROOT}",
+      "env": {"IPHONE_USE_ANALYTICS": "0", "DO_NOT_TRACK": "1", "IPHONE_USE_SAFETY_MODE": "read-only"}
     }
   }
 }

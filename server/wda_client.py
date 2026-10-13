@@ -2,6 +2,9 @@
 import collections
 import http.client
 import json
+import os
+from pathlib import Path
+import re
 import socket
 import time
 from urllib.parse import urlsplit
@@ -12,6 +15,11 @@ ELEMENT_RESPONSE_ATTRIBUTES = "type,label,rect,enabled,attribute/name,attribute/
 SESSION_SETTINGS = {"waitForIdleTimeout": 0, "animationCoolOffTimeout": 0,
                     "shouldUseCompactResponses": False,
                     "elementResponseAttributes": ELEMENT_RESPONSE_ATTRIBUTES}
+# Only the grammar emitted from declarative selector fields, never arbitrary
+# NSPredicate expressions or method/function calls. Quoted text stays data.
+OBSERVATION_LITERAL = r"'(?:[^'\\\x00-\x1f\u2028\u2029]|\\(?:\\|'|u[0-9a-fA-F]{4}))*'"
+OBSERVATION_CLAUSE = r"(?:(?:label|name|value|type) == "+OBSERVATION_LITERAL+r"|label CONTAINS "+OBSERVATION_LITERAL+r"|enabled == (?:true|false))"
+OBSERVATION_PREDICATE = re.compile(OBSERVATION_CLAUSE+r"(?: AND "+OBSERVATION_CLAUSE+r")*")
 
 
 class WDAError(Exception):
@@ -24,14 +32,42 @@ class WDAError(Exception):
 
 
 class WDAClient:
-    def __init__(self, base_url="http://127.0.0.1:18100", timeout=15):
+    def __init__(self, base_url="http://127.0.0.1:18100", timeout=15, read_only=False, tls_dir=None, tls_state=None):
         parsed = urlsplit(base_url)
         if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1") or parsed.path not in ("", "/") or parsed.username or parsed.query or parsed.fragment:
             raise ValueError("PUA URL must be a local HTTP endpoint; forward USB to loopback first.")
         self.host, self.port = parsed.hostname, parsed.port or 80
+        if self.host == "localhost":self.host = "127.0.0.1"
+        self.read_only = read_only
+        self.tls_dir = None if tls_dir is None else Path(tls_dir)
+        self.tls_state = None if tls_state is None else Path(tls_state)
         self.timeout, self.connection, self.session_id = timeout, None, None
         self._settings_session_id, self._settings_error = None, None
         self.records = collections.deque(maxlen=2000)
+
+    def _tls_directory(self):
+        if self.tls_dir is not None:
+            return self.tls_dir
+        configured = os.environ.get("IPHONE_USE_TLS_DIR")
+        if configured:
+            return Path(configured)
+        state = self.tls_state or os.environ.get("IPHONE_USE_STATE_DIR")
+        if not state:
+            return None
+        from wda_tls import material_dir
+        return material_dir(state, client_only=True)
+
+    def _connect(self, budget):
+        try:
+            directory = self._tls_directory()
+        except ValueError as exc:
+            raise WDAError("pua_unreachable", "The local loopback certificate cannot be used, so the phone was not contacted. Do not copy a tls directory from another computer.") from exc
+        if directory is None:
+            self.connection = http.client.HTTPConnection(self.host, self.port, timeout=budget)
+            return
+        from wda_tls import client_context
+        # The recorded URL stays http. The socket is TLS when local material exists.
+        self.connection = http.client.HTTPSConnection(self.host, self.port, timeout=budget, context=client_context(directory))
 
     def close(self):
         if self.connection:
@@ -61,6 +97,8 @@ class WDAClient:
         return budget
 
     def request(self, method, path, payload=None, timeout=None):
+        if self.read_only and not self.allowed_observation_request(method,path,payload):
+            raise WDAError("safety_policy","This WDA route or payload is forbidden by the observation policy.",details={"action_executed":False})
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         readonly = self.is_read(method, path)
         for attempt in range(2 if readonly else 1):
@@ -73,13 +111,43 @@ class WDAClient:
                         and time.monotonic() < deadline):
                     raise
 
+    @staticmethod
+    def allowed_observation_request(method,path,payload):
+        # Never let encoded paths, alternate query flags or CRLF reach WDA.
+        if not isinstance(path,str) or not re.fullmatch(r"/[A-Za-z0-9/-]+(?:\?format=xml(?:&excluded_attributes=(?:accessible|visible,accessible))?)?",path):return False
+        route = path.split("?",1)[0]
+        if "?" in path and not route.endswith("/source"):return False
+        if route.startswith("/session/"):
+            parts=route.split("/")
+            if len(parts)<4 or not re.fullmatch(r"[A-Za-z0-9-]{1,128}",parts[2]):return False
+            route="/"+"/".join(parts[3:])
+        if method=="GET":
+            if payload is not None:return False
+            if route in ("/status","/wda/locked","/wda/activeAppInfo","/screenshot","/window/size","/source","/element/active"):return True
+            return bool(re.fullmatch(r"/element/[A-Za-z0-9-]+/(?:rect|attribute/(?:type|value|hittable))",route))
+        if method!="POST":return False
+        # Creating a session kills the previous WDA session, which can terminate
+        # its app. Observation mode adopts only a session established manually.
+        if path=="/session":return False
+        if route=="/appium/settings":return payload=={"settings":dict(SESSION_SETTINGS)}
+        if route in ("/element","/elements"):
+            return (isinstance(payload,dict) and set(payload)=={"using","value"}
+                    and payload["using"]=="predicate string" and isinstance(payload["value"],str)
+                    and len(payload["value"])<=10000 and bool(OBSERVATION_PREDICATE.fullmatch(payload["value"])))
+        return False
+
     def _request_once(self, method, path, payload, budget, readonly):
         started = time.monotonic()
         deadline = started + budget
         status, code, received = None, None, 0
         try:
+            if "IPHONE_USE_BROKER_FD" in os.environ:
+                from observation_broker import request
+                result=request(method,path,payload,budget)
+                status=200
+                return result
             if self.connection is None:
-                self.connection = http.client.HTTPConnection(self.host, self.port, timeout=budget)
+                self._connect(budget)
             self.connection.timeout = budget
             if self.connection.sock:
                 self.connection.sock.settimeout(budget)
@@ -136,8 +204,8 @@ class WDAClient:
         except (OSError, socket.timeout, http.client.HTTPException) as exc:
             self.close()
             code = "pua_unreachable" if readonly else "action_uncertain"
-            message = ("PUA read connection failed or timed out; no phone action was executed." if readonly
-                       else "PUA connection failed or timed out. Read fresh state before deciding whether to repeat an action.")
+            message = ("The loopback forwarder did not answer. Reconnect USB; the phone port stays on 127.0.0.1. No phone action was executed." if readonly
+                       else "The loopback forwarder did not answer. Reconnect USB and read the phone again before repeating an action.")
             raise WDAError(code, message, uncertain=not readonly) from exc
         finally:
             # No text, predicates, values, screenshots, app IDs or device identifiers in metrics.

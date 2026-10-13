@@ -2,6 +2,9 @@
 // stream bytes only; this program never binds a listener or touches XCTest.
 import http from 'node:http';
 
+// Never let the device library redirect usbmux traffic to an inherited TCP host.
+if (process.env.USBMUXD_SOCKET_ADDRESS) process.exit(1);
+
 // Device-library diagnostics must never corrupt the binary pipe or expose IDs.
 for (const method of ['log', 'info', 'warn', 'error', 'debug']) console[method] = () => {};
 const [udid, portArgument = '9100'] = process.argv.slice(2);

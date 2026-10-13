@@ -21,9 +21,11 @@ import tempfile
 import threading
 import time
 import uuid
+from wda_setup import open_unaliased, read_exclusive_text
 
 MAX_FRAME_BYTES = 4 * 1024 * 1024
 FRAME_LEASE_SECONDS = 5
+FRAME_FRESH_SECONDS = 3
 EVENT_AGE_MS = 10_000
 BUSY_AGE_MS = 15_000
 ACTIVITY_GRACE_MS = 650
@@ -131,6 +133,7 @@ class ScreenHub:
         self._stop = threading.Event()
         self._lease_until = 0.0
         self._frame = None
+        self._frame_received_at = None
         self._seq = 0
         self._stream_id = uuid.uuid4().hex
         self._state_cache = None
@@ -154,7 +157,8 @@ class ScreenHub:
         if cached and cached[0] == signature:
             return cached[1]
         try:
-            raw = json.loads(self._state_path.read_text())
+            text = read_exclusive_text(self._state_path)
+            raw = json.loads(text) if text is not None else {}
         except (OSError, ValueError):
             raw = {}
         if not isinstance(raw, dict):
@@ -213,9 +217,8 @@ class ScreenHub:
 
     @contextlib.contextmanager
     def _state_transaction(self):
-        descriptor = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        descriptor = open_unaliased(self._lock_path, os.O_CREAT | os.O_RDWR)
         try:
-            os.fchmod(descriptor, 0o600)
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             state = self._read_state()
             yield state
@@ -223,9 +226,12 @@ class ScreenHub:
             try:
                 os.fchmod(fd, 0o600)
                 with os.fdopen(fd, "w") as stream:
+                    fd = None
                     json.dump(state, stream, separators=(",", ":"), allow_nan=False)
                 os.replace(temporary, self._state_path)
             finally:
+                if fd is not None:
+                    os.close(fd)
                 if os.path.exists(temporary):
                     os.unlink(temporary)
         finally:
@@ -248,7 +254,9 @@ class ScreenHub:
                 wire_frame = None
             return {"server_time": self._now(), "frame": wire_frame,
                     "stream_id": self._stream_id, "device": self.device,
-                    "frame_available": self._frame is not None and not state["paused"],
+                    "frame_available": (self._frame is not None and not state["paused"]
+                                        and self._frame_received_at is not None
+                                        and time.monotonic() - self._frame_received_at <= FRAME_FRESH_SECONDS),
                     "viewport": state["viewport"],
                     "busy": bool(state["actors"] or state["finished_at"]) and not state["paused"],
                     "paused": state["paused"], "pause_reason": state["pause_reason"],
@@ -398,6 +406,8 @@ class ScreenHub:
             # A close/pause racing the read must not repopulate cleared pixels.
             if stop.is_set():
                 return
+            # Identical pixels still prove that the capture stream is receiving frames.
+            self._frame_received_at = time.monotonic()
             if self._frame and self._frame.get("_jpeg") == raw:
                 return
             self._seq += 1
@@ -406,7 +416,10 @@ class ScreenHub:
 
     def _command(self):
         try:
-            config = json.loads((self.state_dir / "config.json").read_text())
+            config_text = read_exclusive_text(self.state_dir / "config.json")
+            if config_text is None:
+                return None
+            config = json.loads(config_text)
             udid = config.get("udid")
             port = config.get("mjpeg_device_port", 9100)
             if not isinstance(udid, str) or not re.fullmatch(r"[A-Za-z0-9-]{8,64}", udid):
@@ -484,6 +497,7 @@ class ScreenHub:
             finally:
                 self._terminate(child)
                 with self._lock:
+                    self._frame_received_at = None
                     if self._child is child:
                         self._child = None
                     if self._paused():

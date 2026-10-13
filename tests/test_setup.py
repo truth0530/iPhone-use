@@ -1,11 +1,13 @@
 import os
 import io
 import datetime as dt
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import signal
 import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch, MagicMock
@@ -18,9 +20,46 @@ class SetupTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.manager = wda_setup.SetupManager(Path(self.temp.name) / "state")
+        from test_wda_loopback import build_fixtures
+        build_fixtures(self.manager.state_dir)
+        # These lifecycle tests use synthetic builds; real patched-byte checks
+        # are exercised with real Git fixtures in test_safety_hardening.
+        stage=patch.object(wda_setup.SetupManager,"_loopback_source",return_value=Path(self.temp.name))
+        stage.start();self.addCleanup(stage.stop)
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_local_status_probe_rejects_all_redirects_without_contacting_destination(self):
+        requests = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):pass
+            def do_GET(self):
+                requests.append(self.path)
+                self.send_response(self.server.redirect_code)
+                self.send_header("Location", self.server.destination)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        self.manager.base_url = f"http://127.0.0.1:{server.server_port}"
+        try:
+            for code in (301, 302, 303, 307, 308):
+                for destination in ("https://outside.invalid/status", self.manager.base_url + "/other"):
+                    with self.subTest(code=code, destination=destination):
+                        server.redirect_code, server.destination = code, destination
+                        requests.clear()
+                        result = self.manager._probe_status()
+                        self.assertFalse(result["reachable"])
+                        self.assertFalse(result["ready"])
+                        self.assertIn("redirects are forbidden", result["error"])
+                        self.assertIn("refused a redirect", result["next_step"])
+                        self.assertEqual(requests, ["/status"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
 
     def configure(self, **extra):
         return self.manager.setup("configure", udid="00008150-ABCDEF0123456789", team_id="ABCDE12345",
@@ -189,7 +228,9 @@ class SetupTests(unittest.TestCase):
         with patch.object(wda_setup, "_run", side_effect=responses):
             self.assertFalse(self.configure(source_dir=str(source))["ok"])
         self.assertEqual((source / "WebDriverAgent.xcodeproj/project.pbxproj").read_text(), "fixture")
-        responses = [{"ok": True, "stdout": wda_setup.WDA_COMMIT + "\n"}, {"ok": True, "stdout": ""}]
+        digest=wda_setup.hashlib.sha1(b"blob 7\0fixture").hexdigest()
+        responses = [{"ok": True, "stdout": wda_setup.WDA_COMMIT + "\n"},
+                     {"ok": True, "stdout": "100644 blob "+digest+"\tWebDriverAgent.xcodeproj/project.pbxproj\0"}]
         with patch.object(wda_setup, "_run", side_effect=responses):
             self.assertTrue(self.configure(source_dir=str(source))["ok"])
 
@@ -203,7 +244,7 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("build successfully", result["error"])
 
-    def test_start_reuses_ready_external_service_without_spawning(self):
+    def test_start_refuses_unverified_external_service_without_spawning_or_stopping(self):
         self.configure()
         with patch.object(self.manager, "_source", return_value=Path(self.temp.name)), \
              patch.object(self.manager, "_probe_status", return_value={"ready": True, "reachable": True}), \
@@ -211,7 +252,8 @@ class SetupTests(unittest.TestCase):
              patch.object(wda_setup.shutil, "which", return_value="/usr/bin/xcodebuild"), \
              patch.object(self.manager, "_create_job") as create:
             result = self.manager.setup("start", wait_seconds=0)
-        self.assertTrue(result["already_ready"])
+        self.assertFalse(result["ok"])
+        self.assertIn("unverified external WDA",result["error"])
         create.assert_not_called()
 
     def prepare_start(self, port):
@@ -220,6 +262,9 @@ class SetupTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         wda_setup._write_json(self.manager.state_dir / "build.json", {
             "config_fingerprint": wda_setup._fingerprint(self.manager.config), "commit": wda_setup.WDA_COMMIT,
+            "network_policy":wda_setup.NETWORK_POLICY,
+            "loopback_source":str(Path(self.temp.name)),
+            "artifacts_digest":self.manager._build_artifacts(),
         })
 
     def start_without_device(self):
@@ -276,6 +321,10 @@ class SetupTests(unittest.TestCase):
         hints = wda_setup._diagnose("Error Domain=XCTDaemonErrorDomain Code=41: Not authorized for performing UI testing actions")
         self.assertTrue(any("status.ready is true" in hint and "owned start job" in hint for hint in hints))
         self.assertTrue(any("Preserve external services" in hint and "pua_ready" in hint for hint in hints))
+        usb = wda_setup._diagnose("USB connect failed: Unexpected data")
+        self.assertTrue(any("Reconnect the USB cable" in hint and "Wi-Fi" in hint for hint in usb))
+        tls = wda_setup._diagnose("TLS client rejected")
+        self.assertTrue(any("client certificate" in hint and "another computer" in hint for hint in tls))
 
     def test_build_command_uses_explicit_build_for_testing_no_shell(self):
         self.configure()
@@ -322,12 +371,22 @@ class SetupTests(unittest.TestCase):
         source = Path(self.temp.name) / "source"
         (source / "WebDriverAgent.xcodeproj").mkdir(parents=True)
         (source / "WebDriverAgent.xcodeproj/project.pbxproj").write_text("fixture")
+        from test_wda_loopback import listener_fixtures
+        fixture_files=dict(listener_fixtures(),**{"WebDriverAgent.xcodeproj/project.pbxproj":b"fixture"})
+        for name,data in fixture_files.items():
+            path=source/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
         git = bin_dir / "git"
-        git.write_text(f"#!{sys.executable}\nimport sys\nif 'rev-parse' in sys.argv: print({wda_setup.WDA_COMMIT!r})\n")
+        tree="".join("100644 blob "+wda_setup.hashlib.sha1(b"blob "+str(len(data)).encode()+b"\0"+data).hexdigest()+"\t"+name+"\0" for name,data in fixture_files.items())
+        git.write_text(f"#!{sys.executable}\nimport sys\nif 'rev-parse' in sys.argv: print({wda_setup.WDA_COMMIT!r})\n"
+                       f"if 'ls-tree' in sys.argv: sys.stdout.write({tree!r})\n")
         xcode = bin_dir / "xcodebuild"
         xcode.write_text(f"#!{sys.executable}\nimport subprocess, sys, time\nfrom pathlib import Path\n"
+                         "products=Path(sys.argv[sys.argv.index('-derivedDataPath')+1])/'Build/Products'\n"
+                         "runner=products/'Debug-iphoneos/WebDriverAgentRunner-Runner.app/WebDriverAgentRunner-Runner'\n"
+                         "runner.parent.mkdir(parents=True,exist_ok=True);runner.write_bytes(b'synthetic runner');runner.chmod(0o700)\n"
+                         "(products/'fixture.xctestrun').write_bytes(b'synthetic XCTest config')\n"
                          "child=subprocess.Popen([sys.executable,'-c','import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(120)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
-                         "Path('child.pid').write_text(str(child.pid))\ntime.sleep(0.15)\n")
+                         f"Path({str(Path(self.temp.name)/'child.pid')!r}).write_text(str(child.pid))\ntime.sleep(0.15)\n")
         git.chmod(0o700)
         xcode.chmod(0o700)
         config = {"udid": "00008150-ABCDEF0123456789", "team_id": "ABCDE12345", "bundle_id": "com.example.runner",
@@ -338,7 +397,8 @@ class SetupTests(unittest.TestCase):
         process.wait(timeout=10)
         job = wda_setup._read_json(self.manager._job_path(result["job_id"]))
         self.assertEqual(job["state"], "succeeded", job.get("error"))
-        child_pid = int((source / "child.pid").read_text())
+        stage=Path(wda_setup._read_json(self.manager.state_dir/"build.json")["loopback_source"])
+        child_pid = int((Path(self.temp.name) / "child.pid").read_text())
         descendant = wda_setup._run(["ps", "-p", str(child_pid), "-o", "stat="], timeout=2)
         self.assertTrue(not descendant["stdout"].strip() or descendant["stdout"].strip().startswith("Z"))
 
@@ -353,9 +413,13 @@ class SetupTests(unittest.TestCase):
         config = self.manager.config
         wda_setup._write_json(self.manager.state_dir / "build.json", {
             "config_fingerprint": wda_setup._fingerprint(config), "commit": wda_setup.WDA_COMMIT,
+            "network_policy":wda_setup.NETWORK_POLICY,
+            "loopback_source":str(Path(self.temp.name)),
+            "artifacts_digest":self.manager._build_artifacts(),
         })
         job = self.job()
-        job.update(config=config, worker_entrypoint=str(Path(wda_setup.__file__).resolve()), base_url=self.manager.base_url)
+        job.update(config=config, worker_entrypoint=str(Path(wda_setup.__file__).resolve()), base_url=self.manager.base_url,
+                   network_policy=wda_setup.NETWORK_POLICY,loopback_source=str(Path(self.temp.name)),artifacts_digest=self.manager._build_artifacts())
         wda_setup._write_json(self.manager._job_path(job["id"]), job)
         return job
 
@@ -681,12 +745,61 @@ class SetupTests(unittest.TestCase):
         stop.assert_called_once()
         healthy.assert_called_once()
         self.assertEqual(launch.call_args_list[0].args[0][0], "node")
+        self.assertEqual(launch.call_args_list[0].kwargs["env"]["IPHONE_USE_TLS_DIR"], str(self.manager.state_dir / "tls"))
+        self.assertEqual((self.manager.state_dir / "tls" / "client.key").stat().st_mode & 0o077, 0)
         self.assertEqual(launch.call_args_list[1].args[0][-1], "test-without-building")
+        self.assertIsNone(launch.call_args_list[1].kwargs["env"])
         stored = wda_setup._read_json(self.manager._job_path(job["id"]))
         self.assertEqual(stored["recovery_of"], original["id"])
         self.assertEqual(stored["recovery_phase"], "serving")
         self.assertIn("service_started_at", stored)
         self.assertNotIn("recovery_target", self.manager._job_status(stored))
+
+    def test_changed_products_during_dependency_preparation_block_both_device_processes(self):
+        original=self.recovery_fixture()
+        job=dict(original,id="b"*32,action="start",pid=os.getpid(),owner_token="fixture-worker",state="queued")
+        wda_setup._write_json(self.manager._job_path(job["id"]),job)
+        npm=MagicMock();npm.stdout=io.StringIO("");npm.wait.return_value=0;npm.poll.return_value=0
+        node=MagicMock();node.stdout=io.StringIO("");node.poll.return_value=1
+        def prepare(argv,**kwargs):
+            if argv[0]=="npm":
+                runner=self.manager.state_dir/"derived_data/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app/WebDriverAgentRunner-Runner"
+                runner.write_bytes(b"replaced after initial verification")
+                return npm
+            return node
+        with patch.object(wda_setup.SetupManager,"_source",return_value=Path(self.temp.name)), \
+             patch.object(wda_setup.subprocess,"Popen",side_effect=prepare) as launch, \
+             patch.object(wda_setup.signal,"signal"),patch.object(wda_setup.os,"getpgrp",return_value=-1), \
+             patch.object(wda_setup.time,"sleep"):
+            result=wda_setup._worker(str(self.manager.state_dir),job["id"],job["owner_token"],self.manager.base_url)
+        self.assertEqual(result,1)
+        self.assertEqual([call.args[0][0] for call in launch.call_args_list],["npm"])
+        self.assertIn("artifacts changed",wda_setup._read_json(self.manager._job_path(job["id"]))["error"])
+
+    def test_changed_products_after_forward_launch_block_xcode(self):
+        original=self.recovery_fixture()
+        job=dict(original,id="b"*32,action="start",pid=os.getpid(),owner_token="fixture-worker",state="queued")
+        wda_setup._write_json(self.manager._job_path(job["id"]),job)
+        forward=self.manager.state_dir/"runtime/forward"
+        (forward/"node_modules/appium-ios-device").mkdir(parents=True)
+        digest=wda_setup.hashlib.sha256((wda_setup.PLUGIN_ROOT/"tooling/package-lock.json").read_bytes()).hexdigest()
+        wda_setup._write_json(forward/"installed.json",{"lock_hash":digest})
+        node=MagicMock();node.stdout=io.StringIO("");node.poll.side_effect=[None,None,1,1]
+        xcode=MagicMock();xcode.stdout=io.StringIO("");xcode.poll.return_value=1
+        def prepare(argv,**kwargs):
+            if argv[0]=="node":
+                runner=self.manager.state_dir/"derived_data/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app/WebDriverAgentRunner-Runner"
+                runner.write_bytes(b"replaced during forward launch")
+                return node
+            return xcode
+        with patch.object(wda_setup.SetupManager,"_source",return_value=Path(self.temp.name)), \
+             patch.object(wda_setup.subprocess,"Popen",side_effect=prepare) as launch, \
+             patch.object(wda_setup.signal,"signal"),patch.object(wda_setup.os,"getpgrp",return_value=-1), \
+             patch.object(wda_setup.time,"sleep"):
+            result=wda_setup._worker(str(self.manager.state_dir),job["id"],job["owner_token"],self.manager.base_url)
+        self.assertEqual(result,1)
+        self.assertEqual([call.args[0][0] for call in launch.call_args_list],["node"])
+        self.assertIn("artifacts changed",wda_setup._read_json(self.manager._job_path(job["id"]))["error"])
 
 
 if __name__ == "__main__":

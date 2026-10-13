@@ -21,7 +21,7 @@ class RegistrationTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root=Path(self.directory.name).resolve()
         (self.root/"server").mkdir()
-        (self.root/"server/iphone_use.py").write_text("# synthetic entrypoint\n")
+        (self.root/"server/isolated.py").write_text("# synthetic entrypoint\n")
         self.installation={"pluginId":"iphone-use@iphone-use-local","installedPath":str(self.root),"version":"0.1.6"}
         self.config_home = self.root / "codex"
         self.config_home.mkdir()
@@ -37,7 +37,7 @@ class RegistrationTests(unittest.TestCase):
         with patch.object(registration.subprocess,"run") as run:
             self.invoke(self.installation)
         self.assertEqual(run.call_args_list, [
-            call(["codex","mcp","add","iphone_use","--","python3",str(self.root/"server/iphone_use.py")],check=True),
+            call(["codex","mcp","add","iphone_use","--","python3","-I","-S","-B",str(self.root/"server/isolated.py")],check=True),
             call(["codex","mcp","get","iphone_wda","--json"],capture_output=True,text=True,check=False)])
 
     def test_upgrade_removes_only_owned_mcp_and_disables_previous_plugin_preserving_other_settings(self):
@@ -63,7 +63,7 @@ class RegistrationTests(unittest.TestCase):
 
     def test_wrong_plugin_and_missing_entrypoint_do_not_change_config(self):
         for data in ({**self.installation,"pluginId":"unrelated-plugin@example"},self.installation):
-            if data==self.installation:(self.root/"server/iphone_use.py").unlink()
+            if data==self.installation:(self.root/"server/isolated.py").unlink()
             with self.subTest(data=data), patch.object(registration.subprocess,"run") as run, self.assertRaises(SystemExit):
                 self.invoke(data)
             run.assert_not_called()

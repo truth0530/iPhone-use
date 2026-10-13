@@ -110,6 +110,7 @@ class ScreenHubTests(unittest.TestCase):
 
     def test_restart_returns_lower_sequence_with_a_new_stream_identity(self):
         self.hub._frame={"seq":1,"data":"private pixels","mimeType":"image/jpeg","width":440,"height":956}
+        self.hub._frame_received_at=time.monotonic()
         result=self.hub._wire(self.hub._read_state(),after_seq=800)
         self.assertEqual(result["frame"]["seq"],1)
         self.assertTrue(result["frame_available"])
@@ -149,7 +150,7 @@ class ScreenHubTests(unittest.TestCase):
             cached = self.hub._wire(self.hub._read_state())["frame"]
             eventually(lambda: child.poll() is not None and self.hub._child is None)
             self.assertEqual(self.hub._wire(self.hub._read_state())["frame"], cached)
-            self.assertTrue(self.hub.start()["frame_available"])
+            self.assertFalse(self.hub.start()["frame_available"])
             self.hub.close()
             self.assertIsNone(self.hub._wire(self.hub._read_state())["frame"])
             self.assertFalse(self.hub.start()["frame_available"])
@@ -178,6 +179,23 @@ class ScreenHubTests(unittest.TestCase):
             self.assertEqual(encode.call_count, 1)
             self.assertEqual(self.hub._wire(state, after_seq=30)["frame"]["seq"], 31)
             self.assertEqual(encode.call_count, 2)
+
+    def test_stale_cached_pixels_are_not_live_and_identical_receipts_refresh_liveness(self):
+        state = self.hub._read_state()
+        raw = jpeg()
+        with patch("wda_screen.time.monotonic", return_value=100):
+            self.hub._publish_frame(raw, 440, 956, self.hub._stop)
+            first = self.hub._wire(state)
+            self.assertTrue(first["frame_available"])
+        with patch("wda_screen.time.monotonic", return_value=104):
+            stale = self.hub._wire(state)
+            self.assertFalse(stale["frame_available"])
+            self.assertEqual(stale["frame"], first["frame"])
+            self.hub._publish_frame(raw, 440, 956, self.hub._stop)
+            live = self.hub._wire(state, after_seq=first["frame"]["seq"])
+            self.assertTrue(live["frame_available"])
+            self.assertIsNone(live["frame"])
+            self.assertEqual(self.hub._seq, 1)
 
     def test_pause_clears_last_frame_and_a_late_capture_cannot_repopulate_it(self):
         self.hub._publish_frame(jpeg(), 440, 956, self.hub._stop)

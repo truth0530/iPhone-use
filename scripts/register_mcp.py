@@ -48,13 +48,13 @@ def main():
     if installation.get("pluginId")!="iphone-use@iphone-use-local":
         raise SystemExit("Expected the iPhone Use plugin installation result.")
     root=Path(installation["installedPath"]).resolve(strict=True)
-    server=root/"server"/"iphone_use.py"
+    server=root/"server"/"isolated.py"
     if not server.is_file():
         raise SystemExit("Installed iPhone Use MCP entrypoint is missing.")
     print(json.dumps(installation,ensure_ascii=False),flush=True)
     # Same name as the plugin registration: Config wins over Plugin in Codex,
     # so there is one namespace, without the shared agent-plugin tool budget.
-    subprocess.run(["codex","mcp","add","iphone_use","--","python3",str(server)],check=True)
+    subprocess.run(["codex","mcp","add","iphone_use","--","python3","-I","-S","-B",str(server)],check=True)
     retire_previous_registration()
 
 

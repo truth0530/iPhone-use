@@ -17,7 +17,7 @@ class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.runtime = Runtime(self.directory.name)
+        self.runtime = Runtime(self.directory.name, safety_mode="standard")
         self.addCleanup(self.runtime.close)
         self.client = FakeWDA()
         self.client.close = Mock()
